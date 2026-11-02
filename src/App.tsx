@@ -95,66 +95,53 @@ export default function App() {
     setExampleQueue(queueData.example);
   };
 
-  // Restore Supabase Auth session on mount and subscribe to auth state changes
+  // Restore saved account data without showing another account's state after logout.
   useEffect(() => {
-    let isMounted = true;
+    let active = true;
+    let latestRequest = 0;
 
-    const restoreSession = async () => {
+    const hydrate = async (user: { id: string; email?: string } | null) => {
+      const request = ++latestRequest;
+      storageService.setUser(user?.id || null, user?.email || null);
+      if (!active) return;
+      setCurrentUser(user);
+
+      if (!user) {
+        setImportedEvaluation(null);
+        setClasses([...INITIAL_LAND_USE_CLASSES]);
+        setReviewThreshold(0.70);
+        setPredictionResult(null);
+        setRealQueue([]);
+        setExampleQueue([]);
+        return;
+      }
+
       try {
-        const { data } = await supabase.auth.getSession();
-        if (data?.session?.user && isMounted) {
-          const user = data.session.user;
-          setCurrentUser(user);
-          storageService.setUser(user.id, user.email);
-
-          // Restore settings, evaluations, and queue records from Supabase Cloud
-          const settings = await storageService.loadUserSettings();
-          if (settings) {
-            if (settings.classes) setClasses(settings.classes);
-            if (settings.reviewThreshold) setReviewThreshold(settings.reviewThreshold);
-            if (settings.endpointConfig) setEndpointConfig(settings.endpointConfig);
-          }
-
-          const evalData = await storageService.getEvaluationResults();
-          if (evalData) setImportedEvaluation(evalData);
-
-          await refreshQueues();
-        }
+        const [settings, evaluations, queues] = await Promise.all([
+          storageService.loadUserSettings(),
+          storageService.getEvaluationResults(),
+          storageService.getReviewQueueItems(),
+        ]);
+        if (!active || request !== latestRequest || storageService.getUserId() !== user.id) return;
+        setClasses(settings?.classes || [...INITIAL_LAND_USE_CLASSES]);
+        setReviewThreshold(settings?.reviewThreshold ?? 0.70);
+        if (settings?.endpointConfig) setEndpointConfig(settings.endpointConfig);
+        setImportedEvaluation(evaluations);
+        setRealQueue(queues.real);
+        setExampleQueue(queues.example);
       } catch (err) {
-        console.warn('Failed to restore Supabase session:', err);
+        console.error('Could not restore cloud state:', err);
       }
     };
 
-    restoreSession();
-
-    const { data: authListener } = supabase.auth.onAuthStateChange(async (_event, session) => {
-      if (!isMounted) return;
-      if (session?.user) {
-        const user = session.user;
-        setCurrentUser(user);
-        storageService.setUser(user.id, user.email);
-
-        const settings = await storageService.loadUserSettings();
-        if (settings) {
-          if (settings.classes) setClasses(settings.classes);
-          if (settings.reviewThreshold) setReviewThreshold(settings.reviewThreshold);
-          if (settings.endpointConfig) setEndpointConfig(settings.endpointConfig);
-        }
-
-        const evalData = await storageService.getEvaluationResults();
-        if (evalData) setImportedEvaluation(evalData);
-
-        await refreshQueues();
-      } else {
-        setCurrentUser(null);
-        storageService.setUser(null, null);
-        await refreshQueues();
-      }
+    void supabase.auth.getSession().then(({ data }) => hydrate(data.session?.user || null));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      // Keep network calls outside Supabase's synchronous auth callback.
+      setTimeout(() => { if (active) void hydrate(session?.user || null); }, 0);
     });
-
     return () => {
-      isMounted = false;
-      authListener?.subscription?.unsubscribe();
+      active = false;
+      listener.subscription.unsubscribe();
     };
   }, []);
 
@@ -221,8 +208,8 @@ export default function App() {
       };
 
       setEndpointConfig(newConfig);
-      storageService.saveClassTaxonomy(updatedClasses);
-      storageService.saveModelEndpointConfig(newConfig);
+      void storageService.saveClassTaxonomy(updatedClasses).catch(console.error);
+      void storageService.saveModelEndpointConfig(newConfig).catch(console.error);
       predictionService.updateConfig(updatedClasses, newThreshold, newConfig);
 
       return {
@@ -252,7 +239,7 @@ export default function App() {
       metadata: undefined,
     };
     setEndpointConfig(newConfig);
-    storageService.saveModelEndpointConfig(newConfig);
+    void storageService.saveModelEndpointConfig(newConfig).catch(console.error);
     predictionService.updateConfig(classes, reviewThreshold, newConfig);
   };
 
@@ -274,34 +261,31 @@ export default function App() {
     };
   }, []);
 
-  const handleAddToReviewQueue = (item: QueueItem) => {
-    reviewQueueService.addToQueue(item);
-    storageService.saveReviewQueueItem(item);
-    refreshQueues();
+  const handleAddToReviewQueue = async (item: QueueItem) => {
+    await storageService.saveReviewQueueItem(item);
+    await refreshQueues();
   };
 
-  const handleUpdateQueueStatus = (
+  const handleUpdateQueueStatus = async (
     id: string,
     isExample: boolean,
     status: 'pending' | 'flagged' | 'approved' | 'reclassified',
     humanClass?: string,
     notes?: string
   ) => {
-    reviewQueueService.updateStatus(id, isExample, status, humanClass, notes);
-    storageService.updateReviewQueueStatus(id, isExample, status, humanClass, notes);
-    refreshQueues();
+    await storageService.updateReviewQueueStatus(id, isExample, status, humanClass, notes);
+    await refreshQueues();
   };
 
-  const handleRemoveQueueItem = (id: string, isExample: boolean) => {
-    reviewQueueService.removeItem(id, isExample);
-    storageService.removeReviewQueueItem(id, isExample);
-    refreshQueues();
+  const handleRemoveQueueItem = async (id: string, isExample: boolean) => {
+    await storageService.removeReviewQueueItem(id, isExample);
+    await refreshQueues();
   };
 
-  const handleClearQueue = (isExample: boolean) => {
-    reviewQueueService.clearQueue(isExample);
-    storageService.clearReviewQueue(isExample);
-    refreshQueues();
+  const handleClearQueue = async (isExample: boolean) => {
+    if (!window.confirm('Remove these items from the review queue? Saved prediction history will be kept.')) return;
+    await storageService.clearReviewQueue(isExample);
+    await refreshQueues();
   };
 
   const handleSelectClassificationTile = (item: QueueItem) => {
@@ -323,25 +307,26 @@ export default function App() {
 
   const handleSaveEndpointConfig = (newConfig: ModelEndpointConfig) => {
     setEndpointConfig(newConfig);
-    storageService.saveModelEndpointConfig(newConfig);
+    void storageService.saveModelEndpointConfig(newConfig).catch(err => window.alert(err.message));
     predictionService.updateConfig(classes, reviewThreshold, newConfig);
   };
 
   const handleSaveClasses = (newClasses: LandUseClass[]) => {
     setClasses(newClasses);
-    storageService.saveClassTaxonomy(newClasses);
+    void storageService.saveClassTaxonomy(newClasses).catch(err => window.alert(err.message));
     predictionService.updateConfig(newClasses, reviewThreshold, endpointConfig);
   };
 
   const handleSaveThreshold = (newThreshold: number) => {
     setReviewThreshold(newThreshold);
-    storageService.saveUserPreferences({ reviewThreshold: newThreshold });
+    void storageService.saveUserPreferences({ reviewThreshold: newThreshold }).catch(err => window.alert(err.message));
     predictionService.updateConfig(classes, newThreshold, endpointConfig);
   };
 
-  const handleImportEvaluationData = (data: EvaluationImportData) => {
+  const handleImportEvaluationData = async (data: EvaluationImportData): Promise<void> => {
+    const result = await storageService.saveEvaluationResults(data);
+    if (!result.success) throw new Error(result.error || 'Cloud evaluation save failed.');
     setImportedEvaluation(data);
-    storageService.saveEvaluationResults(data);
 
     // Keep taxonomy and ordering synchronized if model provided specific classes
     if (data.classes && data.classes.length > 0) {
@@ -360,14 +345,19 @@ export default function App() {
         };
       });
       setClasses(updatedClasses);
-      storageService.saveClassTaxonomy(updatedClasses);
+      void storageService.saveClassTaxonomy(updatedClasses).catch(err => window.alert(err.message));
       predictionService.updateConfig(updatedClasses, reviewThreshold, endpointConfig);
     }
   };
 
-  const handleClearEvaluationData = () => {
-    setImportedEvaluation(null);
-    storageService.clearEvaluationResults();
+  const handleClearEvaluationData = async () => {
+    if (!window.confirm('Delete all stored evaluation records for this account? Export a backup first if needed.')) return;
+    try {
+      await storageService.clearEvaluationResults();
+      setImportedEvaluation(null);
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : 'Could not delete evaluation records.');
+    }
   };
 
   const totalFlaggedCount = useMemo(() => {

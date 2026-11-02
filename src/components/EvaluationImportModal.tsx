@@ -18,7 +18,7 @@ import { SAMPLE_EVALUATION_TEMPLATE, validateEvaluationJson } from '../utils/eva
 interface EvaluationImportModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onImport: (data: EvaluationImportData) => void;
+  onImport: (data: EvaluationImportData) => Promise<void>;
 }
 
 export const EvaluationImportModal: React.FC<EvaluationImportModalProps> = ({
@@ -28,18 +28,26 @@ export const EvaluationImportModal: React.FC<EvaluationImportModalProps> = ({
 }) => {
   const [jsonText, setJsonText] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
 
   if (!isOpen) return null;
 
-  const handleValidateAndImport = () => {
+  const handleValidateAndImport = async () => {
     setError(null);
     const result = validateEvaluationJson(jsonText);
     if (!result.valid || !result.data) {
       setError(result.error || 'Failed to validate JSON.');
       return;
     }
-    onImport(result.data);
-    onClose();
+    setIsSaving(true);
+    try {
+      await onImport(result.data);
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Cloud save failed. Please retry.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleLoadTemplate = () => {
@@ -80,10 +88,10 @@ export const EvaluationImportModal: React.FC<EvaluationImportModalProps> = ({
         <div className="p-3.5 rounded-lg bg-blue-50/70 border border-blue-200 text-xs text-slate-700 space-y-1.5">
           <div className="flex items-center gap-1.5 font-semibold text-[#102B46]">
             <Info className="w-4 h-4 text-[#1779B8] shrink-0" />
-            <span>Browser-Based In-Memory Parsing</span>
+            <span>Validated Import & Cloud Persistence</span>
           </div>
           <p className="text-[11px] text-slate-600 leading-relaxed">
-            All data is validated and parsed completely in browser memory. No local file downloads or network transmissions are required. Metrics are populated directly into Accuracy, Macro-F1, Dataset partitions, Model Comparisons, and the Confusion Matrix.
+            JSON is validated in the browser, then saved to your authenticated Supabase account. It will reload on your next visit; unsuccessful saves remain open for retry.
           </p>
         </div>
 
@@ -169,10 +177,10 @@ Example schema fields:
           <button
             type="button"
             onClick={handleValidateAndImport}
-            disabled={!jsonText.trim()}
+            disabled={!jsonText.trim() || isSaving}
             className="px-5 py-2 text-xs font-semibold rounded-lg bg-[#102B46] text-white hover:bg-[#1779B8] disabled:bg-slate-200 disabled:text-slate-400 cursor-pointer disabled:cursor-not-allowed transition-colors shadow-xs"
           >
-            Validate & Import Results
+            {isSaving ? 'Saving to Cloud…' : 'Validate & Import Results'}
           </button>
         </div>
       </div>

@@ -212,7 +212,8 @@ export class BrowserTFLiteEngine {
     const reviewRecommended = top.score < thresholdUsed;
 
     return {
-      id: `real-tflite-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      // Supabase's id column is UUID; keep this stable for retries.
+      id: crypto.randomUUID(),
       predictedClass: top.label,
       modelScore: top.score,
       classScores,

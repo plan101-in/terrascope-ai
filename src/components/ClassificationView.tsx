@@ -33,7 +33,7 @@ interface ClassificationViewProps {
   setPredictionResult: (res: PredictionResult | null) => void;
   onOpenModelModal: () => void;
   onOpenClassModal: () => void;
-  onAddToReviewQueue: (item: QueueItem) => void;
+  onAddToReviewQueue: (item: QueueItem) => Promise<void>;
 }
 
 export const ClassificationView: React.FC<ClassificationViewProps> = ({
@@ -301,14 +301,22 @@ export const ClassificationView: React.FC<ClassificationViewProps> = ({
     setPredictionResult({ ...updated });
   };
 
-  const handleQueueSubmission = () => {
+  const handleQueueSubmission = async () => {
     if (!predictionResult) return;
+    if (!predictionResult.isExample && predictionResult.cloudSaveStatus !== 'saved') {
+      setErrorMessage('Save the prediction to the cloud before submitting it for review.');
+      return;
+    }
     const queueItem: QueueItem = {
       ...predictionResult,
       addedAt: new Date().toISOString(),
     };
-    onAddToReviewQueue(queueItem);
-    setAddedToQueueSuccess(true);
+    try {
+      await onAddToReviewQueue(queueItem);
+      setAddedToQueueSuccess(true);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : 'Could not save the review submission.');
+    }
   };
 
   // Helper color resolver

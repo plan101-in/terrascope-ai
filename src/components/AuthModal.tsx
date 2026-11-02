@@ -14,7 +14,7 @@ import {
   User,
   X,
 } from 'lucide-react';
-import { supabase } from '../services/supabaseClient';
+import { isSupabaseConfigured, supabase } from '../services/supabaseClient';
 import { storageService } from '../services/storageService';
 
 interface AuthModalProps {
@@ -123,7 +123,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setIsLoading(true);
     setErrorMessage(null);
     try {
-      await supabase.auth.signOut();
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
       storageService.setUser(null, null);
       onAuthChange(null);
       setSuccessMessage('Signed out successfully.');
@@ -203,7 +204,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   <span>Persistence Status:</span>
                   <span className="inline-flex items-center gap-1 font-semibold text-emerald-700">
                     <ShieldCheck className="w-3.5 h-3.5" />
-                    Supabase Active (RLS)
+                    Signed In (Cloud Account)
                   </span>
                 </div>
                 <div className="flex justify-between items-center text-slate-600">
@@ -220,7 +221,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 <span>Export My Data (JSON Backup)</span>
               </div>
               <p className="text-slate-600">
-                Download a consolidated JSON file of all your persisted settings, dynamic taxonomy, review events, predictions, and evaluation benchmarks.
+                Download settings, prediction metadata, review history, and evaluation results. Original image binaries remain in private Supabase Storage and are not included in this JSON export.
               </p>
               <button
                 type="button"
@@ -253,6 +254,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         ) : (
           /* If Unauthenticated: Sign In / Sign Up Forms */
           <div className="space-y-4">
+            {!isSupabaseConfigured && (
+              <div className="p-3 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800">
+                Missing Supabase configuration. Set VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY in AI Studio environment settings, then rebuild.
+              </div>
+            )}
             {/* Tab selector */}
             <div className="flex border-b border-slate-200">
               <button

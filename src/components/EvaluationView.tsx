@@ -24,7 +24,7 @@ import { EvaluationImportModal } from './EvaluationImportModal';
 interface EvaluationViewProps {
   classes: LandUseClass[];
   importedData: EvaluationImportData | null;
-  onImportData: (data: EvaluationImportData) => void;
+  onImportData: (data: EvaluationImportData) => Promise<void>;
   onClearData: () => void;
 }
 

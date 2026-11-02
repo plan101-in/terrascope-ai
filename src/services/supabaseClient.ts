@@ -1,15 +1,21 @@
 import { createClient, SupabaseClient, User, Session } from '@supabase/supabase-js';
 
-// Supabase configuration with environment variables and verified project credentials
-export const SUPABASE_URL =
-  import.meta.env.VITE_SUPABASE_URL || 'https://kwynxsdgslmtdnteiwxe.supabase.co';
+// The publishable key is browser-safe only when Row Level Security is enabled.
+// Do not hardcode a fallback project: a typo in secrets must not write to the wrong database.
+export const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || '';
 export const SUPABASE_ANON_KEY =
-  import.meta.env.VITE_SUPABASE_ANON_KEY || 'sb_publishable_8c2XfTWsD_y033geyrRRXw_u9MrGsSK';
+  import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+  import.meta.env.VITE_SUPABASE_ANON_KEY ||
+  '';
+
+export const isSupabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 
 export const BUCKET_NAME = 'terrascope-images';
 
 // Global Supabase client instance
-export const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+export const supabase: SupabaseClient = createClient(
+  SUPABASE_URL || 'https://configuration-required.invalid',
+  SUPABASE_ANON_KEY || 'configuration-required', {
   auth: {
     persistSession: true,
     autoRefreshToken: true,
@@ -19,6 +25,10 @@ export const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON
 
 // Cache for signed URLs to reduce latency and redundant roundtrips
 const signedUrlCache = new Map<string, { url: string; expiresAt: number }>();
+
+export function clearSignedImageCache(): void {
+  signedUrlCache.clear();
+}
 
 /**
  * Uploads an image file or blob to the private terrascope-images bucket.
@@ -31,8 +41,10 @@ export async function uploadImageToPrivateBucket(
   originalFilename: string
 ): Promise<{ storagePath: string; error?: string }> {
   try {
-    const extMatch = originalFilename.match(/\.([a-zA-Z0-9]+)$/);
-    const extension = extMatch ? extMatch[1].toLowerCase() : 'jpg';
+    const extension = imagePayload.type === 'image/png' ? 'png' : 'jpg';
+    if (!['image/jpeg', 'image/png'].includes(imagePayload.type)) {
+      return { storagePath: '', error: 'Only JPEG and PNG images are supported.' };
+    }
     const storagePath = `${userId}/${predictionId}.${extension}`;
 
     const contentType = imagePayload.type || (extension === 'png' ? 'image/png' : 'image/jpeg');
@@ -41,10 +53,16 @@ export async function uploadImageToPrivateBucket(
       .from(BUCKET_NAME)
       .upload(storagePath, imagePayload, {
         contentType,
-        upsert: true,
+        // No UPDATE permission required by our storage RLS policy.
+        upsert: false,
       });
 
     if (error) {
+      // A previous attempt may have uploaded this exact UUID file before a DB failure.
+      if (String(error.message).toLowerCase().includes('already exists') ||
+          String(error.message).toLowerCase().includes('duplicate')) {
+        return { storagePath };
+      }
       console.error('Supabase storage upload error:', error);
       return { storagePath, error: error.message };
     }

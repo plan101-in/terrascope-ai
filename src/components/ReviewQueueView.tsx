@@ -29,9 +29,9 @@ interface ReviewQueueViewProps {
     status: 'pending' | 'flagged' | 'approved' | 'reclassified',
     humanClass?: string,
     notes?: string
-  ) => void;
-  onRemoveItem: (id: string, isExample: boolean) => void;
-  onClearQueue: (isExample: boolean) => void;
+  ) => Promise<void>;
+  onRemoveItem: (id: string, isExample: boolean) => Promise<void>;
+  onClearQueue: (isExample: boolean) => Promise<void>;
   onSelectClassificationTile: (item: QueueItem) => void;
 }
 
@@ -58,10 +58,14 @@ export const ReviewQueueView: React.FC<ReviewQueueViewProps> = ({
     setEditClass(item.humanAssignedClass || item.predictedClass);
   };
 
-  const handleSaveModal = (status: 'approved' | 'flagged' | 'reclassified') => {
+  const handleSaveModal = async (status: 'approved' | 'flagged' | 'reclassified') => {
     if (!selectedItem) return;
-    onUpdateStatus(selectedItem.id, selectedItem.isExample, status, editClass, editNotes);
-    setSelectedItem(null);
+    try {
+      await onUpdateStatus(selectedItem.id, selectedItem.isExample, status, editClass, editNotes);
+      setSelectedItem(null);
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : 'Review change could not be saved.');
+    }
   };
 
   const handleExportCSV = () => {
@@ -116,7 +120,7 @@ export const ReviewQueueView: React.FC<ReviewQueueViewProps> = ({
               Export Queue CSV
             </button>
             <button
-              onClick={() => onClearQueue(activeQueueTab === 'example')}
+              onClick={() => onClearQueue(activeQueueTab === 'example').catch(err => window.alert(err.message))}
               className="px-2.5 py-1.5 text-xs font-medium text-rose-600 hover:bg-rose-50 rounded-md transition-colors cursor-pointer"
             >
               Clear Tab
@@ -293,7 +297,7 @@ export const ReviewQueueView: React.FC<ReviewQueueViewProps> = ({
                             Review
                           </button>
                           <button
-                            onClick={() => onRemoveItem(item.id, item.isExample)}
+                            onClick={() => onRemoveItem(item.id, item.isExample).catch(err => window.alert(err.message))}
                             className="p-1 text-slate-400 hover:text-rose-600 transition-colors cursor-pointer"
                             title="Remove from queue"
                           >

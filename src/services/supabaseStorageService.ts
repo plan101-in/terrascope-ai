@@ -15,6 +15,7 @@ import {
   UserPreferences,
 } from '../types/storage';
 import {
+  clearSignedImageCache,
   computeContentHash,
   getSignedImageUrl,
   supabase,
@@ -55,35 +56,18 @@ export class SupabaseStorageService implements StorageService {
   };
 
   private lastSyncTimestamp: string = new Date().toISOString();
-  private settingsSaveTimeout: any = null;
 
-  constructor() {
-    this.initSession();
-  }
-
-  private async initSession() {
-    try {
-      const { data } = await supabase.auth.getSession();
-      if (data?.session?.user) {
-        this.currentUserId = data.session.user.id;
-        this.currentUserEmail = data.session.user.email || null;
-      }
-
-      supabase.auth.onAuthStateChange(async (_event, session) => {
-        if (session?.user) {
-          this.currentUserId = session.user.id;
-          this.currentUserEmail = session.user.email || null;
-        } else {
-          this.currentUserId = null;
-          this.currentUserEmail = null;
-        }
-      });
-    } catch (e) {
-      console.warn('Failed to initialize Supabase auth session:', e);
-    }
-  }
+  // App.tsx owns the one Supabase auth subscription and calls setUser().
 
   public setUser(userId: string | null, email?: string | null) {
+    if (this.currentUserId !== userId) {
+      clearSignedImageCache();
+      this.localRealQueue = [];
+      this.localExampleQueue = [];
+      this.localEvaluationData = null;
+      this.localClasses = [...INITIAL_LAND_USE_CLASSES];
+      this.localPreferences = { reviewThreshold: 0.70, autoFlagLowConfidence: true, themePreference: 'light' };
+    }
     this.currentUserId = userId;
     this.currentUserEmail = email || null;
     this.lastSyncTimestamp = new Date().toISOString();
@@ -103,8 +87,8 @@ export class SupabaseStorageService implements StorageService {
       isPersistent,
       adapterName: isPersistent ? 'SupabaseCloudAdapter' : 'InMemorySessionAdapter',
       statusMessage: isPersistent
-        ? `Authenticated with Supabase Cloud (${this.currentUserEmail || this.currentUserId}). Real-time persistence active.`
-        : 'Running in local session. Sign in to Supabase for persistent cloud storage, review audits, and private imagery.',
+        ? `Signed in as ${this.currentUserEmail || this.currentUserId}. Each cloud write must still be verified.`
+        : 'Not signed in. Predictions are not persistently saved until cloud authentication succeeds.',
       lastSyncTimestamp: this.lastSyncTimestamp,
     };
   }
@@ -129,8 +113,7 @@ export class SupabaseStorageService implements StorageService {
         .maybeSingle();
 
       if (error) {
-        console.warn('Error fetching terrascope_settings:', error.message);
-        return null;
+        throw new Error(`Settings load failed: ${error.message}`);
       }
 
       if (data) {
@@ -138,6 +121,9 @@ export class SupabaseStorageService implements StorageService {
         this.localPreferences.reviewThreshold = threshold;
 
         const config = data.model_config;
+        if (Array.isArray(data.class_config) && data.class_config.length > 0) {
+          this.localClasses = data.class_config;
+        }
         if (config) {
           if (Array.isArray(config.classes) && config.classes.length > 0) {
             this.localClasses = config.classes;
@@ -165,44 +151,29 @@ export class SupabaseStorageService implements StorageService {
         };
       }
     } catch (err) {
-      console.warn('Exception loading settings from Supabase:', err);
+      throw err;
     }
     return null;
   }
 
-  private debounceSaveSettings() {
-    if (!this.currentUserId) return;
-
-    if (this.settingsSaveTimeout) {
-      clearTimeout(this.settingsSaveTimeout);
-    }
-
-    this.settingsSaveTimeout = setTimeout(async () => {
-      try {
-        const payload = {
-          user_id: this.currentUserId,
-          review_threshold: this.localPreferences.reviewThreshold,
-          model_config: {
-            classes: this.localClasses,
-            endpointConfig: this.localEndpointConfig,
-            userPreferences: this.localPreferences,
-          },
-          updated_at: new Date().toISOString(),
-        };
-
-        const { error } = await supabase
-          .from('terrascope_settings')
-          .upsert(payload, { onConflict: 'user_id' });
-
-        if (error) {
-          console.error('Failed to persist terrascope_settings:', error.message);
-        } else {
-          this.lastSyncTimestamp = new Date().toISOString();
-        }
-      } catch (err) {
-        console.error('Exception persisting settings to Supabase:', err);
-      }
-    }, 600);
+  private async persistSettings(): Promise<void> {
+    if (!this.currentUserId) return; // Guest changes are temporary; sign in to persist.
+    const userId = this.currentUserId;
+    const payload = {
+      user_id: userId,
+      review_threshold: this.localPreferences.reviewThreshold,
+      class_config: this.localClasses,
+      model_config: {
+        classes: this.localClasses,
+        endpointConfig: this.localEndpointConfig,
+        userPreferences: this.localPreferences,
+      },
+      updated_at: new Date().toISOString(),
+    };
+    const { error } = await supabase.from('terrascope_settings')
+      .upsert(payload, { onConflict: 'user_id' });
+    if (error) throw new Error(`Settings could not be saved: ${error.message}`);
+    this.lastSyncTimestamp = new Date().toISOString();
   }
 
   async getClassTaxonomy(): Promise<LandUseClass[]> {
@@ -211,7 +182,7 @@ export class SupabaseStorageService implements StorageService {
 
   async saveClassTaxonomy(classes: LandUseClass[]): Promise<void> {
     this.localClasses = [...classes];
-    this.debounceSaveSettings();
+    await this.persistSettings();
   }
 
   async getModelEndpointConfig(): Promise<ModelEndpointConfig> {
@@ -220,7 +191,7 @@ export class SupabaseStorageService implements StorageService {
 
   async saveModelEndpointConfig(config: ModelEndpointConfig): Promise<void> {
     this.localEndpointConfig = { ...config };
-    this.debounceSaveSettings();
+    await this.persistSettings();
   }
 
   async getUserPreferences(): Promise<UserPreferences> {
@@ -232,7 +203,7 @@ export class SupabaseStorageService implements StorageService {
       ...this.localPreferences,
       ...prefs,
     };
-    this.debounceSaveSettings();
+    await this.persistSettings();
   }
 
   // ==========================================
@@ -247,23 +218,12 @@ export class SupabaseStorageService implements StorageService {
     result: PredictionResult,
     rawImageBlob?: Blob | File | null
   ): Promise<{ success: boolean; storagePath?: string; error?: string }> {
-    // Keep local cache updated
-    if (!result.isExample) {
-      const idx = this.localRealQueue.findIndex((i) => i.id === result.id);
-      const queueItem: QueueItem = {
-        ...result,
-        addedAt: new Date().toISOString(),
-      };
-      if (idx !== -1) {
-        this.localRealQueue[idx] = queueItem;
-      } else {
-        this.localRealQueue.unshift(queueItem);
-      }
+    if (!this.currentUserId) {
+      return { success: false, error: 'Sign in before saving a classification to the cloud.' };
     }
 
-    if (!this.currentUserId) {
-      // Local session only
-      return { success: true };
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(result.id)) {
+      return { success: false, error: 'Prediction ID is not a UUID. Run a fresh prediction and retry.' };
     }
 
     const userId = this.currentUserId;
@@ -286,8 +246,8 @@ export class SupabaseStorageService implements StorageService {
         };
       }
       storagePath = uploadRes.storagePath;
-    } else if (!storagePath && result.imageMetadata.dataUrl.startsWith('data:image')) {
-      // Convert base64 dataUrl to blob and upload
+    } else if (!storagePath && result.imageMetadata.dataUrl) {
+      // Handle browser blob URLs and same-origin sample images, not only base64 data URLs.
       try {
         const res = await fetch(result.imageMetadata.dataUrl);
         const blob = await res.blob();
@@ -297,12 +257,15 @@ export class SupabaseStorageService implements StorageService {
           predictionId,
           result.imageMetadata.name
         );
-        if (!uploadRes.error) {
-          storagePath = uploadRes.storagePath;
-        }
+        if (uploadRes.error) return { success: false, error: uploadRes.error };
+        storagePath = uploadRes.storagePath;
       } catch (e) {
-        console.warn('Could not extract blob from dataUrl for storage upload:', e);
+        return { success: false, error: 'Could not read the image for private cloud upload.' };
       }
+    }
+
+    if (!storagePath) {
+      return { success: false, error: 'The original image could not be stored. Prediction was not marked saved.' };
     }
 
     // 2. Insert or upsert record in terrascope_predictions
@@ -312,6 +275,7 @@ export class SupabaseStorageService implements StorageService {
         user_id: userId,
         image_path: storagePath || null,
         image_name: result.imageMetadata.name,
+        image_size_bytes: result.imageMetadata.sizeBytes,
         image_width: result.imageMetadata.width,
         image_height: result.imageMetadata.height,
         predicted_class: result.predictedClass,
@@ -359,8 +323,7 @@ export class SupabaseStorageService implements StorageService {
         .order('created_at', { ascending: false });
 
       if (error) {
-        console.error('Error fetching classification history:', error.message);
-        return [...this.localRealQueue];
+        throw new Error(`Classification history unavailable: ${error.message}`);
       }
 
       const results: PredictionResult[] = [];
@@ -388,7 +351,7 @@ export class SupabaseStorageService implements StorageService {
             name: row.image_name || 'Satellite Tile',
             width: row.image_width || 160,
             height: row.image_height || 160,
-            sizeBytes: 0,
+            sizeBytes: Number(row.image_size_bytes) || 0,
             dataUrl: previewUrl || '',
           },
           reviewStatus: row.review_status || 'pending',
@@ -401,8 +364,7 @@ export class SupabaseStorageService implements StorageService {
 
       return results;
     } catch (e) {
-      console.error('Exception fetching classification history:', e);
-      return [...this.localRealQueue];
+      throw e;
     }
   }
 
@@ -433,18 +395,16 @@ export class SupabaseStorageService implements StorageService {
         .from('terrascope_predictions')
         .select('*')
         .eq('user_id', this.currentUserId)
+        .eq('in_review_queue', true)
         .order('created_at', { ascending: false });
 
       if (error) {
-        console.error('Error fetching review queue from Supabase:', error.message);
-        return {
-          real: [...this.localRealQueue],
-          example: [...this.localExampleQueue],
-        };
+        throw new Error(`Review queue load failed: ${error.message}`);
       }
 
       const realItems: QueueItem[] = [];
-      const exampleItems: QueueItem[] = [];
+      // Illustrative fixtures intentionally remain session-only and separate from real records.
+      const exampleItems: QueueItem[] = [...this.localExampleQueue];
 
       for (const row of data || []) {
         let displayUrl = '';
@@ -470,7 +430,7 @@ export class SupabaseStorageService implements StorageService {
             name: row.image_name || 'Tile',
             width: row.image_width || 160,
             height: row.image_height || 160,
-            sizeBytes: 0,
+            sizeBytes: Number(row.image_size_bytes) || 0,
             dataUrl: displayUrl || '',
           },
           reviewStatus: row.review_status || 'pending',
@@ -481,7 +441,7 @@ export class SupabaseStorageService implements StorageService {
         };
 
         if (row.is_example) {
-          exampleItems.push(item);
+          if (!exampleItems.some(existing => existing.id === item.id)) exampleItems.push(item);
         } else {
           realItems.push(item);
         }
@@ -492,11 +452,7 @@ export class SupabaseStorageService implements StorageService {
 
       return { real: realItems, example: exampleItems };
     } catch (e) {
-      console.error('Exception fetching review queue:', e);
-      return {
-        real: [...this.localRealQueue],
-        example: [...this.localExampleQueue],
-      };
+      throw e;
     }
   }
 
@@ -506,7 +462,18 @@ export class SupabaseStorageService implements StorageService {
       if (idx !== -1) this.localExampleQueue[idx] = item;
       else this.localExampleQueue.unshift(item);
     } else {
-      await this.recordPrediction(item);
+      if (!this.currentUserId) throw new Error('Sign in to save a review submission.');
+      const { data, error } = await supabase
+        .from('terrascope_predictions')
+        .update({ in_review_queue: true, updated_at: new Date().toISOString() })
+        .eq('id', item.id)
+        .eq('user_id', this.currentUserId)
+        .select('id')
+        .maybeSingle();
+      if (error || !data) throw new Error(error?.message || 'Save the prediction before adding it to review.');
+      const idx = this.localRealQueue.findIndex(i => i.id === item.id);
+      if (idx >= 0) this.localRealQueue[idx] = item;
+      else this.localRealQueue.unshift(item);
     }
   }
 
@@ -517,19 +484,13 @@ export class SupabaseStorageService implements StorageService {
     humanClass?: string,
     notes?: string
   ): Promise<void> {
-    // 1. Update local state
+    // 1. Do not show success before the cloud write succeeds.
     const targetQueue = isExample ? this.localExampleQueue : this.localRealQueue;
     const existing = targetQueue.find((i) => i.id === id);
     const prevStatus = existing?.reviewStatus || 'pending';
 
-    if (existing) {
-      existing.reviewStatus = status;
-      if (humanClass !== undefined) existing.humanAssignedClass = humanClass;
-      if (notes !== undefined) existing.reviewerNotes = notes;
-    }
-
-    // 2. Persist to Supabase if authenticated
-    if (this.currentUserId) {
+    if (!isExample && !this.currentUserId) throw new Error('Sign in to persist review decisions.');
+    if (!isExample && this.currentUserId) {
       try {
         const updatePayload: any = {
           review_status: status,
@@ -545,7 +506,7 @@ export class SupabaseStorageService implements StorageService {
           .eq('user_id', this.currentUserId);
 
         if (updateErr) {
-          console.error('Failed to update review status in terrascope_predictions:', updateErr.message);
+          throw new Error(updateErr.message);
         }
 
         // Insert review event audit log
@@ -565,13 +526,20 @@ export class SupabaseStorageService implements StorageService {
           });
 
         if (eventErr) {
-          console.warn('Failed to record review event audit log:', eventErr.message);
+          // Status was persisted, but the separate audit write failed.
+          throw new Error(`Review status saved, but audit log failed: ${eventErr.message}`);
         } else {
           this.lastSyncTimestamp = new Date().toISOString();
         }
       } catch (err) {
         console.error('Exception updating review queue in Supabase:', err);
+        throw err;
       }
+    }
+    if (existing) {
+      existing.reviewStatus = status;
+      if (humanClass !== undefined) existing.humanAssignedClass = humanClass;
+      if (notes !== undefined) existing.reviewerNotes = notes;
     }
   }
 
@@ -579,14 +547,14 @@ export class SupabaseStorageService implements StorageService {
     if (isExample) {
       this.localExampleQueue = this.localExampleQueue.filter((i) => i.id !== id);
     } else {
-      this.localRealQueue = this.localRealQueue.filter((i) => i.id !== id);
-      if (this.currentUserId) {
-        await supabase
+      if (!this.currentUserId) throw new Error('Sign in to remove a cloud queue item.');
+      const { error } = await supabase
           .from('terrascope_predictions')
-          .delete()
+          .update({ in_review_queue: false })
           .eq('id', id)
           .eq('user_id', this.currentUserId);
-      }
+      if (error) throw new Error(error.message);
+      this.localRealQueue = this.localRealQueue.filter((i) => i.id !== id);
     }
   }
 
@@ -594,14 +562,14 @@ export class SupabaseStorageService implements StorageService {
     if (isExample) {
       this.localExampleQueue = [];
     } else {
-      this.localRealQueue = [];
-      if (this.currentUserId) {
-        await supabase
+      if (!this.currentUserId) throw new Error('Sign in to clear the cloud review queue.');
+      const { error } = await supabase
           .from('terrascope_predictions')
-          .delete()
+          .update({ in_review_queue: false })
           .eq('user_id', this.currentUserId)
-          .eq('is_example', false);
-      }
+          .eq('in_review_queue', true);
+      if (error) throw new Error(error.message);
+      this.localRealQueue = [];
     }
   }
 
@@ -624,11 +592,15 @@ export class SupabaseStorageService implements StorageService {
         .maybeSingle();
 
       if (error) {
-        console.error('Error fetching evaluation from Supabase:', error.message);
-        return this.localEvaluationData;
+        throw new Error(`Evaluation load failed: ${error.message}`);
       }
 
       if (data) {
+        if (data.original_report && typeof data.original_report === 'object' &&
+            Array.isArray(data.original_report.classes)) {
+          this.localEvaluationData = data.original_report as EvaluationImportData;
+          return this.localEvaluationData;
+        }
         const metrics = data.metrics || {};
         const parsed: EvaluationImportData = {
           project: metrics.project || 'TerraScope AI',
@@ -641,8 +613,8 @@ export class SupabaseStorageService implements StorageService {
             test_images: 0,
           },
           metrics: {
-            accuracy: metrics.accuracy ?? 0,
-            macro_f1: metrics.macro_f1 ?? 0,
+            accuracy: metrics.accuracy,
+            macro_f1: metrics.macro_f1,
           },
           confusion_matrix: Array.isArray(data.confusion_matrix) ? data.confusion_matrix : [],
           model_comparison: Array.isArray(data.model_comparison) ? data.model_comparison : [],
@@ -653,21 +625,20 @@ export class SupabaseStorageService implements StorageService {
         return parsed;
       }
     } catch (e) {
-      console.error('Exception fetching evaluation:', e);
+      throw e;
     }
 
     return this.localEvaluationData;
   }
 
   async saveEvaluationResults(data: EvaluationImportData): Promise<{ success: boolean; isDuplicate?: boolean; error?: string }> {
-    this.localEvaluationData = JSON.parse(JSON.stringify(data));
-
     if (!this.currentUserId) {
-      return { success: true };
+      return { success: false, error: 'Sign in to save evaluation results to the cloud.' };
     }
 
     try {
-      const serialized = JSON.stringify(data);
+      // importedAt is generated on each import; exclude it from the deduplication hash.
+      const serialized = JSON.stringify({ ...data, importedAt: undefined });
       const hash = await computeContentHash(serialized);
 
       // Check for duplicate import hash
@@ -679,6 +650,7 @@ export class SupabaseStorageService implements StorageService {
         .maybeSingle();
 
       if (existing) {
+        this.localEvaluationData = JSON.parse(JSON.stringify(data));
         return { success: true, isDuplicate: true };
       }
 
@@ -688,7 +660,9 @@ export class SupabaseStorageService implements StorageService {
         user_id: this.currentUserId,
         import_hash: hash,
         model_name: data.model_name,
+        source_type: data.practice_mode ? 'synthetic' : 'official',
         class_names: data.classes,
+        original_report: data,
         metrics: {
           accuracy: data.metrics.accuracy,
           macro_f1: data.metrics.macro_f1,
@@ -712,6 +686,7 @@ export class SupabaseStorageService implements StorageService {
         return { success: false, error: error.message };
       }
 
+      this.localEvaluationData = JSON.parse(JSON.stringify(data));
       this.lastSyncTimestamp = new Date().toISOString();
       return { success: true, isDuplicate: false };
     } catch (err: any) {
@@ -721,13 +696,11 @@ export class SupabaseStorageService implements StorageService {
   }
 
   async clearEvaluationResults(): Promise<void> {
+    if (!this.currentUserId) throw new Error('Sign in before deleting cloud evaluation records.');
+    const { error } = await supabase.from('terrascope_evaluations')
+      .delete().eq('user_id', this.currentUserId);
+    if (error) throw new Error(error.message);
     this.localEvaluationData = null;
-    if (this.currentUserId) {
-      await supabase
-        .from('terrascope_evaluations')
-        .delete()
-        .eq('user_id', this.currentUserId);
-    }
   }
 
   // ==========================================
@@ -787,21 +760,42 @@ export class SupabaseStorageService implements StorageService {
   // ==========================================
 
   async exportAllUserData(): Promise<UserDataBackup> {
+    if (!this.currentUserId) throw new Error('Sign in before exporting your cloud data.');
     const predictions = await this.getClassificationHistory();
     const evaluations: EvaluationImportData[] = [];
-    if (this.localEvaluationData) {
-      evaluations.push(this.localEvaluationData);
+    const evaluationQuery = await supabase.from('terrascope_evaluations')
+      .select('original_report, metrics, model_name, class_names, confusion_matrix, model_comparison, created_at')
+      .eq('user_id', this.currentUserId)
+      .order('created_at', { ascending: false });
+    if (evaluationQuery.error) throw new Error(evaluationQuery.error.message);
+    for (const row of evaluationQuery.data || []) {
+      if (row.original_report && Array.isArray(row.original_report.classes)) {
+        evaluations.push(row.original_report as EvaluationImportData);
+      } else {
+        evaluations.push({
+          project: row.metrics?.project || 'TerraScope AI',
+          practice_mode: Boolean(row.metrics?.practice_mode),
+          model_name: row.model_name,
+          classes: row.class_names || [],
+          dataset: row.metrics?.dataset || { train_images: 0, validation_images: 0, test_images: 0 },
+          metrics: { accuracy: row.metrics?.accuracy, macro_f1: row.metrics?.macro_f1 },
+          confusion_matrix: row.confusion_matrix || [],
+          model_comparison: row.model_comparison || [],
+          importedAt: row.created_at,
+        });
+      }
     }
 
     let reviewEvents: ReviewEventRecord[] = [];
     if (this.currentUserId) {
       try {
-        const { data } = await supabase
+        const { data, error } = await supabase
           .from('terrascope_review_events')
           .select('*')
           .eq('user_id', this.currentUserId)
           .order('created_at', { ascending: false });
 
+        if (error) throw new Error(error.message);
         if (data) {
           reviewEvents = data.map((r) => ({
             id: r.id,
@@ -816,7 +810,7 @@ export class SupabaseStorageService implements StorageService {
           }));
         }
       } catch (e) {
-        console.warn('Could not export review events:', e);
+        throw new Error('Review history could not be exported; backup cancelled rather than returning incomplete data.');
       }
     }
 
@@ -855,7 +849,8 @@ export class SupabaseStorageService implements StorageService {
 
       // Restore evaluations
       if (Array.isArray(backup.evaluations) && backup.evaluations.length > 0) {
-        await this.saveEvaluationResults(backup.evaluations[0]);
+        const saved = await this.saveEvaluationResults(backup.evaluations[0]);
+        if (!saved.success) throw new Error(saved.error || 'Evaluation restore failed');
       }
 
       // Restore predictions
@@ -863,7 +858,8 @@ export class SupabaseStorageService implements StorageService {
       if (Array.isArray(backup.predictions)) {
         for (const p of backup.predictions) {
           if (!p.isExample) {
-            await this.recordPrediction(p);
+            const saved = await this.recordPrediction(p);
+            if (!saved.success) throw new Error(saved.error || `Prediction restore failed: ${p.id}`);
             importedPredictions++;
           }
         }

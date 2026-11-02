@@ -139,7 +139,7 @@ export class PredictionService {
     const reviewRecommended = top.score < this.reviewThreshold;
 
     return {
-      id: `example-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      id: crypto.randomUUID(),
       predictedClass: top.label,
       modelScore: top.score,
       classScores,
@@ -207,7 +207,7 @@ export class PredictionService {
       const isBelowThreshold = topScore < this.reviewThreshold;
 
       return {
-        id: `real-${Date.now()}`,
+        id: crypto.randomUUID(),
         predictedClass: data.predicted_class,
         modelScore: topScore,
         classScores: data.class_scores || [],
