@@ -1,0 +1,6 @@
+{
+  "name": "TerraScope AI",
+  "description": "Satellite Land-Use Classification — Turning Satellite Pixels into Planning Insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
